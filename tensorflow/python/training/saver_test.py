@@ -565,50 +565,25 @@ class SaverTest(test.TestCase):
       ):
         save.save(sess, save_path)
 
-  def testSaveToCurrentDirectory(self):
+  def testSaveToURI(self):
+    save_path = "file://" + os.path.join(
+        self.get_temp_dir(), "uri")
 
-    temp_dir = self.get_temp_dir()
+    # Build a graph with 2 parameter nodes, and Save and
+    # Restore nodes for them.
+    v0 = variables.Variable(10.0, name="v0")
+    v1 = variables.Variable(20.0, name="v1")
+    save = saver_module.Saver({"v0": v0, "v1": v1}, restore_sequentially=True)
+    init_all_op = variables.global_variables_initializer()
 
-    # Store original current dir for later recovery, set current dir to temp_dir
-    old_current_dir = os.getcwd()
-    os.chdir(temp_dir)
+    with self.test_session() as sess:
+      # Initialize all variables
+      sess.run(init_all_op)
 
-    try:    
-
-      # Save to current directory, no ./ prepended to path name
-      save_path = "variables"
-
-      with session.Session("", graph=ops_lib.Graph()) as sess:
-
-        one = variables.Variable(1.0)
-        twos = variables.Variable([2.0, 2.0, 2.0])
-        
-        init = variables.global_variables_initializer()
-        save = saver_module.Saver()
-
-        init.run()
-        save.save(sess, save_path)
-
-      with session.Session("", graph=ops_lib.Graph()) as sess:
-
-        one = variables.Variable(0.0)
-        twos = variables.Variable([0.0, 0.0, 0.0])
-
-        # Saver with no arg, defaults to 'all variables'.
-        save = saver_module.Saver()
-        save.restore(sess, save_path)
-
-        self.assertAllClose(1.0, one.eval())
-        self.assertAllClose([2.0, 2.0, 2.0], twos.eval())
-
-        # Go back to original current dir
-        os.chdir(old_current_dir)
-
-    except Exception as exception:
-
-      # Go back to original current dir and then bubble up the exception
-      os.chdir(old_current_dir)
-      raise exception
+      # Check that the parameter nodes have been initialized.
+      self.assertEqual(10.0, v0.eval())
+      self.assertEqual(20.0, v1.eval())
+      save.save(sess, save_path)
 
 
 class SaveRestoreShardedTest(test.TestCase):
@@ -737,7 +712,7 @@ class SaveRestoreShardedTest(test.TestCase):
       sd = save.as_saver_def()
       self.assertTrue(sd.sharded)
 
-  def testPartitionedVariables(self):
+  def _testPartitionedVariables(self, use_resource):
     var_full_shape = [10, 3]
     # Allows save/restore mechanism to work w/ different slicings.
     var_name = "my_var"
@@ -751,6 +726,9 @@ class SaveRestoreShardedTest(test.TestCase):
 
         if slices:
           assert not partitioner
+          # TODO(apassos): make create_partitioned_variables take use_resource
+          # option to make this test passable without creating a named
+          # variable_scope.
           vs = partitioned_variables.create_partitioned_variables(
               var_full_shape, slices, rnd, name=var_name)
         elif partitioner:
@@ -759,10 +737,14 @@ class SaveRestoreShardedTest(test.TestCase):
                   var_name,
                   shape=var_full_shape,
                   initializer=rnd,
-                  partitioner=partitioner)
+                  partitioner=partitioner,
+                  use_resource=use_resource)
           ]
         else:
-          vs = [variables.Variable(rnd, name=var_name)]
+          if use_resource:
+            vs = [resource_variable_ops.ResourceVariable(rnd, name=var_name)]
+          else:
+            vs = [variables.Variable(rnd, name=var_name)]
 
         variables.global_variables_initializer().run()
         if call_saver_with_dict:
@@ -847,6 +829,12 @@ class SaveRestoreShardedTest(test.TestCase):
       saved_full = _save()
       restored_full = _restore(slices=[1, 3])
       self.assertAllEqual(saved_full, restored_full)
+
+  def testPartitionedVariable(self):
+    self._testPartitionedVariables(use_resource=False)
+
+  def testPartitionedResourceVariable(self):
+    self._testPartitionedVariables(use_resource=True)
 
 
 class MaxToKeepTest(test.TestCase):
