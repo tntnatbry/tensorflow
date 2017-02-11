@@ -27,8 +27,12 @@ import re
 import codegen
 import six
 
+
 # A regular expression capturing a python indentifier.
 IDENTIFIER_RE = '[a-zA-Z_][a-zA-Z0-9_]*'
+# A regular expression for capturing a @{symbol} reference.
+_FULL_NAME_RE = '%s(.%s)*' % (IDENTIFIER_RE, IDENTIFIER_RE)
+SYMBOL_REFERENCE_RE = re.compile(r'@\{(' + _FULL_NAME_RE + r')\}')
 
 
 def documentation_path(full_name):
@@ -136,20 +140,39 @@ def replace_references(string, relative_path_to_root, duplicate_of):
 
   Args:
     string: A string in which "@{symbol}" references should be replaced.
-    relative_path_to_root: The relative path from the contianing document to the
+    relative_path_to_root: The relative path from the containing document to the
       root of the API documentation that is being linked to.
     duplicate_of: A map from duplicate names to preferred names of API symbols.
 
   Returns:
     `string`, with "@{symbol}" references replaced by Markdown links.
   """
-  full_name_re = '%s(.%s)*' % (IDENTIFIER_RE, IDENTIFIER_RE)
-  symbol_reference_re = re.compile(r'@\{(' + full_name_re + r')\}')
-  return re.sub(symbol_reference_re,
+  return re.sub(SYMBOL_REFERENCE_RE,
                 lambda match: _markdown_link(match.group(1), match.group(1),  # pylint: disable=g-long-lambda
                                              relative_path_to_root,
                                              duplicate_of),
                 string)
+
+
+# TODO(aselle): Collect these into a big list for all modules and functions
+# and make a rosetta stone page.
+def _handle_compatibility(doc):
+  """Parse and remove compatibility blocks from the main docstring.
+
+  Args:
+    doc: The docstring that contains compatibility notes"
+
+  Returns:
+    a tuple of the modified doc string and a hash that maps from compatibility
+    note type to the text of the note.
+  """
+  compatibility_notes = {}
+  match_compatibility = re.compile(r'[ \t]*@compatibility\((\w+)\)\s*\n'
+                                   r'((?:[^@\n]*\n)+)'
+                                   r'\s*@end_compatibility')
+  for f in match_compatibility.finditer(doc):
+    compatibility_notes[f.group(1)] = f.group(2)
+  return match_compatibility.subn(r'', doc)[0], compatibility_notes
 
 
 def _md_docstring(py_object, relative_path_to_root, duplicate_of):
@@ -160,7 +183,7 @@ def _md_docstring(py_object, relative_path_to_root, duplicate_of):
 
   ```python
   relative_path_to_root = os.path.relpath(
-    os.path.dirname(documentation_path(full_name)) or '.', '.')
+    path='.', start=os.path.dirname(documentation_path(full_name)) or '.')
   ```
 
   Args:
@@ -177,6 +200,9 @@ def _md_docstring(py_object, relative_path_to_root, duplicate_of):
   """
   # TODO(wicke): If this is a partial, use the .func docstring and add a note.
   raw_docstring = _get_raw_docstring(py_object)
+  raw_docstring = replace_references(raw_docstring, relative_path_to_root,
+                                     duplicate_of)
+  raw_docstring, compatibility = _handle_compatibility(raw_docstring)
   raw_lines = raw_docstring.split('\n')
 
   # Define regular expressions used during parsing below.
@@ -189,10 +215,9 @@ def _md_docstring(py_object, relative_path_to_root, duplicate_of):
 
   def is_section_start(i):
     # Previous line is empty, line i is "Word:", and next line is indented.
-    return (i > 0 and not raw_lines[i-1].strip() and
+    return (i > 0  and i < len(raw_lines) and not raw_lines[i-1].strip() and
             re.match(section_re, raw_lines[i]) and
             len(raw_lines) > i+1 and raw_lines[i+1].startswith('  '))
-
   for i, line in enumerate(raw_lines):
     if not in_special_section and is_section_start(i):
       in_special_section = True
@@ -210,13 +235,14 @@ def _md_docstring(py_object, relative_path_to_root, duplicate_of):
       lines.append(symbol_list_item_re.sub(r'* <b>`\1`</b>: ', line))
     else:
       lines.append(line)
-
   docstring = '\n'.join(lines)
-
+  sorted_keys = compatibility.keys()
+  sorted_keys.sort()
+  for key in sorted_keys:
+    value = compatibility[key]
+    docstring += ('\n\n#### %s compatibility\n%s\n' % (key, value))
   # TODO(deannarubin): Improve formatting for devsite
-  # TODO(deannarubin): Interpret @compatibility and other formatting notes.
-
-  return replace_references(docstring, relative_path_to_root, duplicate_of)
+  return docstring
 
 
 def _get_arg_spec(func):
@@ -360,8 +386,21 @@ def _generate_signature(func, reverse_index):
   return '(%s)' % ', '.join(args_list)
 
 
+def _get_guides_markdown(duplicate_names, guide_index, relative_path):
+  all_guides = []
+  for name in duplicate_names:
+    all_guides.extend(guide_index.get(name, []))
+  if not all_guides: return ''
+  prefix = '../' * (relative_path.count('/') + 3)
+  links = sorted(set([guide_ref.make_md_link(prefix)
+                      for guide_ref in all_guides]))
+  return 'See the guide%s: %s\n\n' % (
+      's' if len(links) > 1 else '', ', '.join(links))
+
+
 def _generate_markdown_for_function(full_name, duplicate_names,
-                                    function, duplicate_of, reverse_index):
+                                    function, duplicate_of, reverse_index,
+                                    guide_index):
   """Generate Markdown docs for a function or method.
 
   This function creates a documentation page for a function. It uses the
@@ -377,15 +416,18 @@ def _generate_markdown_for_function(full_name, duplicate_names,
     duplicate_of: A map of duplicate full names to master names. Used to resolve
       @{symbol} references in the docstring.
     reverse_index: A map from object ids in the index to full names.
+    guide_index: A `dict` mapping symbol name strings to objects with a
+      `make_md_link()` method.
 
   Returns:
     A string that can be written to a documentation file for this function.
   """
   # TODO(wicke): Make sure this works for partials.
   relative_path = os.path.relpath(
-      os.path.dirname(documentation_path(full_name)) or '.', '.')
+      path='.', start=os.path.dirname(documentation_path(full_name)) or '.')
   docstring = _md_docstring(function, relative_path, duplicate_of)
   signature = _generate_signature(function, reverse_index)
+  guides = _get_guides_markdown(duplicate_names, guide_index, relative_path)
 
   if duplicate_names:
     aliases = '\n'.join(['### `%s`' % (name + signature)
@@ -394,11 +436,13 @@ def _generate_markdown_for_function(full_name, duplicate_names,
   else:
     aliases = ''
 
-  return '#`%s%s`\n\n%s%s' % (full_name, signature, aliases, docstring)
+  return '# `%s%s`\n\n%s%s%s' % (
+      full_name, signature, aliases, guides, docstring)
 
 
 def _generate_markdown_for_class(full_name, duplicate_names, py_class,
-                                 duplicate_of, index, tree, reverse_index):
+                                 duplicate_of, index, tree,
+                                 reverse_index, guide_index):
   """Generate Markdown docs for a class.
 
   This function creates a documentation page for a class. It uses the
@@ -418,20 +462,23 @@ def _generate_markdown_for_class(full_name, duplicate_names, py_class,
     index: A map from full names to python object references.
     tree: A map from full names to the names of all documentable child objects.
     reverse_index: A map from object ids in the index to full names.
+    guide_index: A `dict` mapping symbol name strings to objects with a
+      `make_md_link()` method.
 
   Returns:
     A string that can be written to a documentation file for this class.
   """
   relative_path = os.path.relpath(
-      os.path.dirname(documentation_path(full_name)) or '.', '.')
+      path='.', start=os.path.dirname(documentation_path(full_name)) or '.')
   docstring = _md_docstring(py_class, relative_path, duplicate_of)
+  guides = _get_guides_markdown(duplicate_names, guide_index, relative_path)
   if duplicate_names:
     aliases = '\n'.join(['### `class %s`' % name for name in duplicate_names])
     aliases += '\n\n'
   else:
     aliases = ''
 
-  docs = '# `%s`\n\n%s%s\n\n' % (full_name, aliases, docstring)
+  docs = '# `%s`\n\n%s%s%s\n\n' % (full_name, aliases, guides, docstring)
 
   field_names = []
   properties = []
@@ -506,7 +553,7 @@ def _generate_markdown_for_module(full_name, duplicate_names, module,
     A string that can be written to a documentation file for this module.
   """
   relative_path = os.path.relpath(
-      os.path.dirname(documentation_path(full_name)) or '.', '.')
+      path='.', start=os.path.dirname(documentation_path(full_name)) or '.')
   docstring = _md_docstring(module, relative_path, duplicate_of)
   if duplicate_names:
     aliases = '\n'.join(['### Module `%s`' % name for name in duplicate_names])
@@ -549,12 +596,11 @@ def _generate_markdown_for_module(full_name, duplicate_names, module,
 
 
 _CODE_URL_PREFIX = (
-    'https://www.tensorflow.org/code/')
+    'https://www.tensorflow.org/code/tensorflow/')
 
 
-def generate_markdown(full_name, py_object,
-                      duplicate_of, duplicates,
-                      index, tree, reverse_index, base_dir):
+def generate_markdown(full_name, py_object, duplicate_of, duplicates,
+                      index, tree, reverse_index, guide_index, base_dir):
   """Generate Markdown docs for a given object that's part of the TF API.
 
   This function uses _md_docstring to obtain the docs pertaining to
@@ -586,6 +632,8 @@ def generate_markdown(full_name, py_object,
     tree: A `dict` mapping a fully qualified name to the names of all its
       members. Used to populate the members section of a class or module page.
     reverse_index: A `dict` mapping objects in the index to full names.
+    guide_index: A `dict` mapping symbol name strings to objects with a
+      `make_md_link()` method.
     base_dir: A base path that is stripped from file locations written to the
       docs.
 
@@ -605,13 +653,13 @@ def generate_markdown(full_name, py_object,
   if (inspect.ismethod(py_object) or inspect.isfunction(py_object) or
       # Some methods in classes from extensions come in as routines.
       inspect.isroutine(py_object)):
-    markdown = _generate_markdown_for_function(master_name, duplicate_names,
-                                               py_object, duplicate_of,
-                                               reverse_index)
+    markdown = _generate_markdown_for_function(
+        master_name, duplicate_names, py_object, duplicate_of,
+        reverse_index, guide_index)
   elif inspect.isclass(py_object):
-    markdown = _generate_markdown_for_class(master_name, duplicate_names,
-                                            py_object, duplicate_of,
-                                            index, tree, reverse_index)
+    markdown = _generate_markdown_for_class(
+        master_name, duplicate_names, py_object, duplicate_of, index, tree,
+        reverse_index, guide_index)
   elif inspect.ismodule(py_object):
     markdown = _generate_markdown_for_module(master_name, duplicate_names,
                                              py_object, duplicate_of,
@@ -625,13 +673,13 @@ def generate_markdown(full_name, py_object,
   # TODO(wicke): Only use decorators that support this in TF.
 
   try:
-    path = os.path.relpath(inspect.getfile(py_object), base_dir)
+    path = os.path.relpath(path=inspect.getfile(py_object), start=base_dir)
 
     # TODO(wicke): If this is a generated file, point to the source instead.
 
     # Never include links outside this code base.
     if not path.startswith('..'):
-      markdown += '\n\nDefined in [`%s`](%s%s).\n\n' % (
+      markdown += '\n\nDefined in [`tensorflow/%s`](%s%s).\n\n' % (
           path, _CODE_URL_PREFIX, path)
   except TypeError:  # getfile throws TypeError if py_object is a builtin.
     markdown += '\n\nThis is an alias for a Python built-in.'
@@ -666,8 +714,8 @@ def generate_global_index(library_name, index, duplicate_of):
         if parent_name in index and inspect.isclass(index[parent_name]):
           # Skip methods (=functions with class parents).
           continue
-      symbol_links.append((index_name,
-                           _markdown_link(index_name, full_name,
+      symbol_links.append((full_name,
+                           _markdown_link(full_name, full_name,
                                           '.', duplicate_of)))
 
   lines = ['# All symbols in %s' % library_name, '']
