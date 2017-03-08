@@ -21,6 +21,7 @@ limitations under the License.
 #include "tensorflow/compiler/xla/ptr_util.h"
 #include "tensorflow/compiler/xla/service/backend.h"
 #include "tensorflow/compiler/xla/service/llvm_ir/llvm_util.h"
+#include "tensorflow/compiler/xla/service/service_executable_run_options.h"
 #include "tensorflow/compiler/xla/status_macros.h"
 
 namespace se = ::perftools::gputools;
@@ -72,9 +73,7 @@ StatusOr<Backend::StreamPtr> BorrowStreamForDevice(int device_ordinal,
   if (device_ordinal < 0) {
     device_ordinal = backend->default_device_ordinal();
   }
-  TF_ASSIGN_OR_RETURN(se::StreamExecutor * exec,
-                      backend->stream_executor(device_ordinal));
-  return backend->BorrowStream(exec);
+  return backend->BorrowStream(device_ordinal);
 }
 }  // namespace
 
@@ -175,51 +174,18 @@ StatusOr<std::unique_ptr<ShapedBuffer>> LocalExecutable::Run(
   if (options.allocator() == nullptr) {
     actual_options.set_allocator(backend_->memory_allocator());
   }
+  ServiceExecutableRunOptions service_options(actual_options,
+                                              backend_->StreamBorrower());
 
   if (executable_->dumping()) {
-    return ExecuteAndDump(&actual_options, arguments);
+    return ExecuteAndDump(&service_options, arguments);
   }
-  return executable_->ExecuteOnStream(&actual_options, arguments,
-                                      /*hlo_execution_profile=*/nullptr);
-}
-
-tensorflow::Status LocalExecutable::Run(
-    const tensorflow::gtl::ArraySlice<const ShapedBuffer*> arguments,
-    const ExecutableRunOptions& options, ShapedBuffer* result) {
-  const ComputationLayout& computation_layout =
-      executable_->module_config().entry_computation_layout();
-  TF_RETURN_IF_ERROR(ValidateExecutionOptions(arguments, options));
-
-  if (!computation_layout.result_layout().MatchesLayoutInShape(
-          result->shape())) {
-    return InvalidArgument(
-        "result buffer does not match shape or layout of computation result: "
-        "expected %s, got %s",
-        ShapeUtil::HumanString(computation_layout.result_layout().shape())
-            .c_str(),
-        ShapeUtil::HumanString(result->shape()).c_str());
-  }
-
-  ExecutableRunOptions actual_options = options;
-  Backend::StreamPtr stream;
-  if (options.stream() == nullptr) {
-    TF_ASSIGN_OR_RETURN(
-        stream, BorrowStreamForDevice(options.device_ordinal(), backend_));
-    actual_options.set_stream(stream.get());
-  }
-  if (options.allocator() == nullptr) {
-    actual_options.set_allocator(backend_->memory_allocator());
-  }
-
-  if (executable_->dumping()) {
-    return Unimplemented("dumping execution not supported on this path");
-  }
-  return executable_->ExecuteOnStream(&actual_options, arguments, result,
+  return executable_->ExecuteOnStream(&service_options, arguments,
                                       /*hlo_execution_profile=*/nullptr);
 }
 
 StatusOr<std::unique_ptr<ShapedBuffer>> LocalExecutable::ExecuteAndDump(
-    const ExecutableRunOptions* run_options,
+    const ServiceExecutableRunOptions* run_options,
     const tensorflow::gtl::ArraySlice<const ShapedBuffer*> arguments) {
   executable_->session_module()->set_execution_platform(
       backend_->platform()->Name());
@@ -282,14 +248,6 @@ StatusOr<std::unique_ptr<ShapedBuffer>> LocalClient::ExecuteLocally(
     const LocalExecuteOptions& options) {
   return local_service_->ExecuteLocally(computation.handle(), arguments,
                                         options);
-}
-
-tensorflow::Status LocalClient::ExecuteLocally(
-    const Computation& computation,
-    const tensorflow::gtl::ArraySlice<const ShapedBuffer*> arguments,
-    const LocalExecuteOptions& options, ShapedBuffer* result) {
-  return local_service_->ExecuteLocally(computation.handle(), arguments,
-                                        options, result);
 }
 
 StatusOr<std::vector<std::unique_ptr<AotCompilationResult>>>

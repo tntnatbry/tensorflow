@@ -14,7 +14,7 @@ TF Learn is a simplified interface for TensorFlow, to get people started on pred
 
 ## Installation
 
-[Install TensorFlow](../../../../g3doc/get_started/os_setup.md), and then simply import `learn` via `from tensorflow.contrib.learn` or use `tf.contrib.learn`.
+[Install TensorFlow](https://www.tensorflow.org/install/), and then simply import `learn` via `from tensorflow.contrib.learn` or use `tf.contrib.learn`.
 
 Optionally you can install [scikit-learn](http://scikit-learn.org/stable/) and [pandas](http://pandas.pydata.org/) for additional functionality.
 
@@ -56,6 +56,7 @@ Optionally you can install [scikit-learn](http://scikit-learn.org/stable/) and [
 -   [`DNNLinearCombinedRegressor`](https://www.tensorflow.org/code/tensorflow/contrib/learn/python/learn/estimators/dnn_linear_combined.py)
     ([docs](../../../../g3doc/api_docs/python/contrib.learn.md#DNNLinearCombinedRegressor))
 -   [`SVM`](https://www.tensorflow.org/code/tensorflow/contrib/learn/python/learn/estimators/svm.py)
+    ([docs](https://www.tensorflow.org/code/tensorflow/contrib/learn/python/learn/estimators/g3doc/svm.md))
 -   [`GMM`](https://www.tensorflow.org/code/tensorflow/contrib/factorization/python/ops/gmm.py)
     ([docs](https://www.tensorflow.org/code/tensorflow/contrib/factorization/g3doc/gmm.md))
 -   [`KMeansClustering`](https://www.tensorflow.org/code/tensorflow/contrib/learn/python/learn/estimators/kmeans.py)

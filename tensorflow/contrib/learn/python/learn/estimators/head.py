@@ -19,6 +19,8 @@ from __future__ import division
 from __future__ import print_function
 
 import abc
+import inspect
+
 import six
 
 from tensorflow.contrib import framework as framework_lib
@@ -127,7 +129,8 @@ def _multi_class_head(n_classes,
                       enable_centered_bias=False,
                       head_name=None,
                       thresholds=None,
-                      metric_class_ids=None):
+                      metric_class_ids=None,
+                      loss_fn=None):
   """Creates a _Head for multi class single label classification.
 
   The Head uses softmax cross entropy loss.
@@ -149,18 +152,25 @@ def _multi_class_head(n_classes,
     metric_class_ids: List of class IDs for which we should report per-class
       metrics. Must all be in the range `[0, n_classes)`. Invalid if
       `n_classes` is 2.
+    loss_fn: Optional function that takes (`labels`, `logits`, `weights`) as
+      parameter and returns a weighted scalar loss. `weights` should be
+      optional. See `tf.losses`
 
   Returns:
     An instance of _MultiClassHead.
 
   Raises:
-    ValueError: if `n_classes` is < 2, or `metric_class_ids` is provided when
-      `n_classes` is 2.
+    ValueError: If `n_classes` is < 2, or `metric_class_ids` is provided when
+          `n_classes` is 2.
+    ValueError: If loss_fn does not have expected signature.
   """
   if (n_classes is None) or (n_classes < 2):
     raise ValueError("n_classes must be > 1 for classification: %s." %
                      n_classes)
+  if loss_fn:
+    _verify_loss_fn_args(loss_fn)
 
+  loss_fn = _wrap_custom_loss_fn(loss_fn) if loss_fn else None
   if n_classes == 2:
     if metric_class_ids:
       raise ValueError("metric_class_ids invalid for n_classes==2.")
@@ -169,7 +179,8 @@ def _multi_class_head(n_classes,
         weight_column_name=weight_column_name,
         enable_centered_bias=enable_centered_bias,
         head_name=head_name,
-        thresholds=thresholds)
+        thresholds=thresholds,
+        loss_fn=loss_fn)
 
   return _MultiClassHead(
       n_classes=n_classes,
@@ -178,7 +189,8 @@ def _multi_class_head(n_classes,
       enable_centered_bias=enable_centered_bias,
       head_name=head_name,
       thresholds=thresholds,
-      metric_class_ids=metric_class_ids)
+      metric_class_ids=metric_class_ids,
+      loss_fn=loss_fn)
 
 
 def _binary_svm_head(
@@ -223,10 +235,11 @@ def _multi_label_head(n_classes,
                       enable_centered_bias=False,
                       head_name=None,
                       thresholds=None,
-                      metric_class_ids=None):
+                      metric_class_ids=None,
+                      loss_fn=None):
   """Creates a _Head for multi label classification.
 
-  The Head uses softmax cross entropy loss.
+  The Head uses sigmoid cross entropy loss.
 
   Args:
     n_classes: Integer, number of classes, must be >= 2
@@ -244,15 +257,22 @@ def _multi_label_head(n_classes,
     thresholds: thresholds for eval metrics, defaults to [.5]
     metric_class_ids: List of class IDs for which we should report per-class
       metrics. Must all be in the range `[0, n_classes)`.
+    loss_fn: Optional function that takes (`labels`, `logits`, `weights`) as
+      parameter and returns a weighted scalar loss. `weights` should be
+      optional. See `tf.losses`
 
   Returns:
-    An instance of _MultiClassHead.
+    An instance of _MultiLabelHead.
 
   Raises:
-    ValueError: if n_classes is < 2
+    ValueError: If n_classes is < 2
+    ValueError: If loss_fn does not have expected signature.
   """
   if n_classes < 2:
     raise ValueError("n_classes must be > 1 for classification.")
+  if loss_fn:
+    _verify_loss_fn_args(loss_fn)
+
   return _MultiLabelHead(
       n_classes=n_classes,
       label_name=label_name,
@@ -260,7 +280,8 @@ def _multi_label_head(n_classes,
       enable_centered_bias=enable_centered_bias,
       head_name=head_name,
       thresholds=thresholds,
-      metric_class_ids=metric_class_ids)
+      metric_class_ids=metric_class_ids,
+      loss_fn=_wrap_custom_loss_fn(loss_fn) if loss_fn else None)
 
 
 def _multi_head(heads, loss_weights=None):
@@ -293,6 +314,11 @@ def _multi_head(heads, loss_weights=None):
       return math_ops.add_n(losses)
 
   return _MultiHead(heads, loss_combiner=_weighted_loss_combiner)
+
+
+def no_op_train_fn(loss):
+  del loss
+  return control_flow_ops.no_op()
 
 
 # TODO(zakaria): Make the classes public once we are ready for users to subclass
@@ -336,7 +362,8 @@ class _Head(object):
       mode: Estimator's `ModeKeys`.
       labels: Labels `Tensor`, or `dict` of same.
       train_op_fn: Function that takes a scalar loss and returns an op to
-          optimize with the loss.
+          optimize with the loss. Must not be `None` in TRAIN mode. If you want
+          to optimize loss yourself you can pass `no_op_train_fn`.
       logits: logits `Tensor`, or `dict` of same, to be used for the head.
       logits_input: `Tensor` from which to build logits.
       scope: Optional scope for `variable_scope`.
@@ -406,7 +433,7 @@ class _SingleHead(_Head):
 
 
 # TODO(zakaria): use contrib losses.
-def _mean_squared_loss(logits, labels):
+def _mean_squared_loss(labels, logits, weights=None):
   with ops.name_scope(None, "mean_squared_loss", (logits, labels)) as name:
     logits = ops.convert_to_tensor(logits)
     labels = ops.convert_to_tensor(labels)
@@ -417,10 +444,11 @@ def _mean_squared_loss(logits, labels):
     if len(logits.get_shape()) == 1:
       logits = array_ops.expand_dims(logits, dim=(1,))
     logits.get_shape().assert_is_compatible_with(labels.get_shape())
-    return math_ops.square(logits - math_ops.to_float(labels), name=name)
+    loss = math_ops.square(logits - math_ops.to_float(labels), name=name)
+    return _compute_weighted_loss(loss, weights)
 
 
-def _poisson_loss(logits, labels):
+def _poisson_loss(labels, logits, weights=None):
   """Computes poisson loss from logits."""
   with ops.name_scope(None, "_poisson_loss", (logits, labels)) as name:
     logits = ops.convert_to_tensor(logits)
@@ -432,8 +460,9 @@ def _poisson_loss(logits, labels):
     if len(logits.get_shape()) == 1:
       logits = array_ops.expand_dims(logits, dim=(1,))
     logits.get_shape().assert_is_compatible_with(labels.get_shape())
-    return nn.log_poisson_loss(labels, logits,
-                               compute_full_loss=True, name=name)
+    loss = nn.log_poisson_loss(labels, logits, compute_full_loss=True,
+                               name=name)
+    return _compute_weighted_loss(loss, weights)
 
 
 def _logits(logits_input, logits, logits_dimension):
@@ -515,14 +544,15 @@ def _create_model_fn_ops(features,
     eval_metric_ops = None
     if (mode != model_fn.ModeKeys.INFER) and (labels is not None):
       weight_tensor = _weight_tensor(features, weight_column_name)
-      loss, weighted_average_loss = _loss(
-          loss_fn(logits, labels), weight_tensor)
+      loss, weighted_average_loss = loss_fn(labels, logits, weight_tensor)
       logging_ops.scalar_summary(
           _summary_key(head_name, mkey.LOSS), weighted_average_loss)
 
-      if (mode == model_fn.ModeKeys.TRAIN) and (train_op_fn is not None):
+      if mode == model_fn.ModeKeys.TRAIN:
+        if train_op_fn is None:
+          raise ValueError("train_op_fn can not be None in TRAIN mode")
         train_op = _train_op(loss, labels, train_op_fn, centered_bias,
-                             logits_dimension, loss_fn)
+                             logits_dimension, loss_fn, weight_tensor)
       eval_metric_ops = metrics_fn(
           weighted_average_loss, predictions, labels, weight_tensor)
     return model_fn.ModelFnOps(
@@ -633,7 +663,7 @@ class _RegressionHead(_SingleHead):
               metrics_lib.streaming_mean(eval_loss)}
 
 
-def _log_loss_with_two_classes(logits, labels):
+def _log_loss_with_two_classes(labels, logits, weights=None):
   with ops.name_scope(None, "log_loss_with_two_classes",
                       (logits, labels)) as name:
     logits = ops.convert_to_tensor(logits)
@@ -642,8 +672,9 @@ def _log_loss_with_two_classes(logits, labels):
     # sigmoid_cross_entropy_with_logits requires [batch_size, 1] labels.
     if len(labels.get_shape()) == 1:
       labels = array_ops.expand_dims(labels, dim=(1,))
-    return nn.sigmoid_cross_entropy_with_logits(
-        labels=labels, logits=logits, name=name)
+    loss = nn.sigmoid_cross_entropy_with_logits(labels=labels, logits=logits,
+                                                name=name)
+    return _compute_weighted_loss(loss, weights)
 
 
 def _one_class_to_two_class_logits(logits):
@@ -658,7 +689,7 @@ class _BinaryLogisticHead(_SingleHead):
                weight_column_name=None,
                enable_centered_bias=False,
                head_name=None,
-               loss_fn=_log_loss_with_two_classes,
+               loss_fn=None,
                thresholds=None):
     """Base type for all single heads.
 
@@ -687,7 +718,7 @@ class _BinaryLogisticHead(_SingleHead):
         weight_column_name=weight_column_name,
         head_name=head_name)
     self._thresholds = thresholds if thresholds else (.5,)
-    self._loss_fn = loss_fn
+    self._loss_fn = loss_fn if loss_fn else _log_loss_with_two_classes
     self._enable_centered_bias = enable_centered_bias
 
   def create_model_fn_ops(self,
@@ -795,7 +826,7 @@ class _BinaryLogisticHead(_SingleHead):
     return metrics
 
 
-def _softmax_cross_entropy_loss(logits, labels):
+def _softmax_cross_entropy_loss(labels, logits, weights=None):
   with ops.name_scope(
       None, "softmax_cross_entropy_loss", (logits, labels,)) as name:
     labels = ops.convert_to_tensor(labels)
@@ -807,8 +838,9 @@ def _softmax_cross_entropy_loss(logits, labels):
     # sparse_softmax_cross_entropy_with_logits requires [batch_size] labels.
     if len(labels.get_shape()) == 2:
       labels = array_ops.squeeze(labels, squeeze_dims=(1,))
-    return nn.sparse_softmax_cross_entropy_with_logits(
+    loss = nn.sparse_softmax_cross_entropy_with_logits(
         labels=labels, logits=logits, name=name)
+    return _compute_weighted_loss(loss, weights)
 
 
 class _MultiClassHead(_SingleHead):
@@ -820,7 +852,7 @@ class _MultiClassHead(_SingleHead):
                weight_column_name=None,
                enable_centered_bias=False,
                head_name=None,
-               loss_fn=_softmax_cross_entropy_loss,
+               loss_fn=None,
                thresholds=None,
                metric_class_ids=None):
     """_Head for classification.
@@ -857,7 +889,7 @@ class _MultiClassHead(_SingleHead):
     if (n_classes is None) or (n_classes <= 2):
       raise ValueError("n_classes must be > 2: %s." % n_classes)
     self._thresholds = thresholds if thresholds else (.5,)
-    self._loss_fn = loss_fn
+    self._loss_fn = loss_fn if loss_fn else _softmax_cross_entropy_loss
     self._enable_centered_bias = enable_centered_bias
     self._metric_class_ids = tuple([] if metric_class_ids is None else
                                    metric_class_ids)
@@ -952,7 +984,7 @@ class _MultiClassHead(_SingleHead):
             self.head_name, mkey.CLASS_LOGITS_MEAN % class_id)] = (
                 _predictions_streaming_mean(logits, weights, class_id))
         metrics[_summary_key(self.head_name, mkey.CLASS_AUC % class_id)] = (
-            _class_streaming_auc(logits, labels, weights, class_id,
+            _class_streaming_auc(probabilities, labels, weights, class_id,
                                  self.logits_dimension))
 
     return metrics
@@ -1012,11 +1044,12 @@ class _BinarySvmHead(_SingleHead):
   def __init__(self, label_name, weight_column_name, enable_centered_bias,
                head_name, thresholds):
 
-    def _loss_fn(logits, labels):
+    def _loss_fn(labels, logits, weights=None):
       with ops.name_scope(None, "hinge_loss", (logits, labels)) as name:
         with ops.control_dependencies((_assert_labels_rank(labels),)):
           labels = array_ops.reshape(labels, shape=(-1, 1))
-        return losses_lib.hinge_loss(logits, labels, scope=name)
+        loss = losses_lib.hinge_loss(logits=logits, labels=labels, scope=name)
+        return _compute_weighted_loss(loss, weights)
 
     super(_BinarySvmHead, self).__init__(
         problem_type=constants.ProblemType.LOGISTIC_REGRESSION,
@@ -1102,7 +1135,8 @@ class _MultiLabelHead(_SingleHead):
                enable_centered_bias,
                head_name,
                thresholds,
-               metric_class_ids=None):
+               metric_class_ids=None,
+               loss_fn=None):
 
     super(_MultiLabelHead, self).__init__(
         problem_type=constants.ProblemType.CLASSIFICATION,
@@ -1112,7 +1146,7 @@ class _MultiLabelHead(_SingleHead):
         head_name=head_name)
 
     self._thresholds = thresholds if thresholds else (.5,)
-    self._loss_fn = _sigmoid_cross_entropy_loss
+    self._loss_fn = loss_fn if loss_fn else _sigmoid_cross_entropy_loss
     self._enable_centered_bias = enable_centered_bias
     self._metric_class_ids = tuple([] if metric_class_ids is None else
                                    metric_class_ids)
@@ -1201,13 +1235,9 @@ class _MultiLabelHead(_SingleHead):
             self.head_name, mkey.CLASS_LOGITS_MEAN % class_id)] = (
                 _predictions_streaming_mean(logits, weights, class_id))
         metrics[_summary_key(self.head_name, mkey.CLASS_AUC % class_id)] = (
-            _streaming_auc(logits, labels, weights, class_id))
+            _streaming_auc(probabilities, labels, weights, class_id))
 
     return metrics
-
-
-def _noop(unused_loss):
-  return control_flow_ops.no_op()
 
 
 class _MultiHead(_Head):
@@ -1266,10 +1296,15 @@ class _MultiHead(_Head):
       labels: Labels `Tensor`, or `dict` of same.
       train_op_fn: Function that takes a scalar loss and returns an op to
           optimize with the loss.
-      logits: Concatenated logits of (x, 1) shape where x is the sum of
-          `logits_dimension` of all the heads, i.e., same as `logits_dimension`
-          of this class. This function will split the logits tensor and pass
-          logits of proper size to each head.
+      logits: Concatenated logits for all heads or a dict of head name to logits
+          tensor. If concatenated logits, it should have (batchsize, x) shape
+          where x is the sum of `logits_dimension` of all the heads,
+          i.e., same as `logits_dimension` of this class. create_model_fn_ops
+          will split the logits tensor and pass logits of proper size to each
+          head. This is useful if we want to be agnostic about whether you
+          creating a single versus multihead. logits can also be a dict for
+          convenience where you are creating the head specific logits explicitly
+          and don't want to concatenate them yourself.
       logits_input: tensor to build logits from.
       scope: Optional scope for variable_scope. If provided, will be passed to
         all heads. Most users will want to set this to `None`, so each head
@@ -1287,28 +1322,37 @@ class _MultiHead(_Head):
     if logits is None:
       # Use logits_input.
       for head in self._heads:
-        # TODO(ptucker): Do we need to let each head create its own logits?
         all_model_fn_ops.append(
             head.create_model_fn_ops(
                 features=features,
                 mode=mode,
                 labels=labels,
-                train_op_fn=_noop,
+                train_op_fn=no_op_train_fn,
                 logits_input=logits_input,
                 scope=scope))
     else:
-      # Split logits for each head.
-      for head, head_logits in zip(self._heads, self._split_logits(logits)):
+      head_logits_pairs = []
+      if isinstance(logits, dict):
+        head_logits_pairs = []
+        for head in self._heads:
+          head_logits_pairs.append((head, logits[head.head_name]))
+      else:
+        # Split logits for each head.
+        head_logits_pairs = zip(self._heads, self._split_logits(logits))
+
+      for head, head_logits in head_logits_pairs:
         all_model_fn_ops.append(
             head.create_model_fn_ops(
                 features=features,
                 mode=mode,
                 labels=labels,
-                train_op_fn=_noop,
+                train_op_fn=no_op_train_fn,
                 logits=head_logits,
                 scope=scope))
 
     if mode == model_fn.ModeKeys.TRAIN:
+      if train_op_fn is None:
+        raise ValueError("train_op_fn can not be None in TRAIN mode.")
       return self._combine_train(all_model_fn_ops, train_op_fn)
     if mode == model_fn.ModeKeys.INFER:
       return self._combine_infer(all_model_fn_ops)
@@ -1411,15 +1455,6 @@ class _MultiHead(_Head):
         eval_metric_ops=metrics)
 
 
-def _weighted_loss(loss, weight):
-  """Returns cumulative weighted loss as 1d `Tensor`."""
-  with ops.name_scope(None, "weighted_loss", (loss, weight)) as name:
-    return math_ops.multiply(
-        array_ops.reshape(loss, shape=(-1,)),
-        array_ops.reshape(weight, shape=(-1,)),
-        name=name)
-
-
 def _weight_tensor(features, weight_column_name):
   """Returns weights as 1d `Tensor`."""
   if not weight_column_name:
@@ -1429,8 +1464,10 @@ def _weight_tensor(features, weight_column_name):
     return math_ops.to_float(features[weight_column_name])
 
 
-def _loss(loss_unweighted, weight, name="loss"):
-  """Returns a tuple of (loss, weighted_average_loss).
+# TODO(zakaria): This function is needed for backward compatibility and should
+#   be removed when we migrate to core.
+def _compute_weighted_loss(loss_unweighted, weight, name="loss"):
+  """Returns a tuple of (loss_train, loss_report).
 
   loss is used for gradient descent while weighted_average_loss is used for
   summaries to be backward compatible.
@@ -1449,21 +1486,36 @@ def _loss(loss_unweighted, weight, name="loss"):
     name: Optional name
 
   Returns:
-    A tuple of (loss, weighted_average_loss)
+    A tuple of losses. First one for training and the second one for reproting.
   """
   with ops.name_scope(name, values=(loss_unweighted, weight)) as name_scope:
     if weight is None:
       loss = math_ops.reduce_mean(loss_unweighted, name=name_scope)
       return loss, loss
-    loss_weighted = _weighted_loss(loss_unweighted, weight)
+    with ops.name_scope(None, "weighted_loss",
+                        (loss_unweighted, weight)) as name:
+      weighted_loss = math_ops.multiply(
+          array_ops.reshape(loss_unweighted, shape=(-1,)),
+          array_ops.reshape(weight, shape=(-1,)), name=name)
     # TODO(ptucker): This might be wrong if weights are broadcast to loss shape.
     # We should use tf.losses here.
-    weighted_average_loss = math_ops.div(
-        math_ops.reduce_sum(loss_weighted),
+    weighted_loss_mean = math_ops.reduce_mean(weighted_loss, name=name_scope)
+    weighted_loss_normalized = math_ops.div(
+        math_ops.reduce_sum(weighted_loss),
         math_ops.to_float(math_ops.reduce_sum(weight)),
         name="weighted_average_loss")
-    loss = math_ops.reduce_mean(loss_weighted, name=name_scope)
-    return loss, weighted_average_loss
+
+    return weighted_loss_mean, weighted_loss_normalized
+
+
+def _wrap_custom_loss_fn(loss_fn):
+  def _wrapper(labels, logits, weights=None):
+    if weights is None:
+      loss = loss_fn(labels, logits)
+    else:
+      loss = loss_fn(labels, logits, weights)
+    return loss, loss
+  return _wrapper
 
 
 def _check_mode_valid(mode):
@@ -1471,6 +1523,26 @@ def _check_mode_valid(mode):
   if (mode != model_fn.ModeKeys.TRAIN and mode != model_fn.ModeKeys.INFER and
       mode != model_fn.ModeKeys.EVAL):
     raise ValueError("mode=%s unrecognized." % str(mode))
+
+
+def _get_arguments(func):
+  """Returns a spec of given func."""
+  if hasattr(func, "__code__"):
+    # Regular function.
+    return inspect.getargspec(func)
+  elif hasattr(func, "__call__"):
+    # Callable object.
+    return _get_arguments(func.__call__)
+  elif hasattr(func, "func"):
+    # Partial function.
+    return _get_arguments(func.func)
+
+
+def _verify_loss_fn_args(loss_fn):
+  args = _get_arguments(loss_fn).args
+  for arg_name in ["labels", "logits", "weights"]:
+    if arg_name not in args:
+      raise ValueError("Argument %s not found in loss_fn." % arg_name)
 
 
 def _centered_bias(logits_dimension, head_name=None):
@@ -1504,7 +1576,8 @@ def _centered_bias(logits_dimension, head_name=None):
   return centered_bias
 
 
-def _centered_bias_step(centered_bias, logits_dimension, labels, loss_fn):
+def _centered_bias_step(centered_bias, logits_dimension, labels,
+                        loss_fn, weights):
   """Creates and returns training op for centered bias."""
   if (logits_dimension is None) or (logits_dimension < 1):
     raise ValueError("Invalid logits_dimension %s." % logits_dimension)
@@ -1515,7 +1588,7 @@ def _centered_bias_step(centered_bias, logits_dimension, labels, loss_fn):
         (batch_size, logits_dimension))
     with ops.name_scope(None, "centered_bias", (labels, logits)):
       centered_bias_loss = math_ops.reduce_mean(
-          loss_fn(logits, labels), name="training_loss")
+          loss_fn(labels, logits, weights), name="training_loss")
   # Learn central bias by an optimizer. 0.1 is a convervative lr for a
   # single variable.
   return training.AdagradOptimizer(0.1).minimize(
@@ -1526,16 +1599,12 @@ def _summary_key(head_name, val):
   return "%s/%s" % (val, head_name) if head_name else val
 
 
-def _train_op(loss,
-              labels,
-              train_op_fn,
-              centered_bias=None,
-              logits_dimension=None,
-              loss_fn=None):
+def _train_op(loss, labels, train_op_fn, centered_bias, logits_dimension,
+              loss_fn, weights):
   """Returns op for the training step."""
   if centered_bias is not None:
     centered_bias_step = _centered_bias_step(centered_bias, logits_dimension,
-                                             labels, loss_fn)
+                                             labels, loss_fn, weights)
   else:
     centered_bias_step = None
   with ops.name_scope(None, "train_op", (loss, labels)):
@@ -1545,12 +1614,13 @@ def _train_op(loss,
     return train_op
 
 
-def _sigmoid_cross_entropy_loss(logits, labels):
+def _sigmoid_cross_entropy_loss(labels, logits, weights=None):
   with ops.name_scope(None, "sigmoid_cross_entropy_loss",
                       (logits, labels)) as name:
     # sigmoid_cross_entropy_with_logits requires [batch_size, n_classes] labels.
-    return nn.sigmoid_cross_entropy_with_logits(
+    loss = nn.sigmoid_cross_entropy_with_logits(
         labels=math_ops.to_float(labels), logits=logits, name=name)
+    return _compute_weighted_loss(loss, weights)
 
 
 def _float_weights_or_none(weights):
